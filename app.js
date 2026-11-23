@@ -44,13 +44,40 @@ for(const event of ['dragenter','dragover']) drop.addEventListener(event,e=>{e.p
 for(const event of ['dragleave','drop']) drop.addEventListener(event,e=>{e.preventDefault();drop.classList.remove('drag');});
 drop.addEventListener('drop', e=>selectFile(e.dataTransfer.files[0]));
 $('quality').addEventListener('input',()=> $('quality-value').textContent=$('quality').value+'%');
+const optionIds=['images','text','fonts','grayscale','contrast','quantize','quotes','clean-metadata','generate-cover'];
+$('preset').addEventListener('change', () => {
+  const preset=$('preset').value;
+  if (preset === 'custom') return;
+  for(const id of optionIds) $(id).checked = ['images','text','grayscale','contrast','quantize'].includes(id) || preset==='full';
+  clearDownload();
+});
+for(const id of optionIds) $(id).addEventListener('change',()=> { $('preset').value='custom'; clearDownload(); });
+$('filename-format').addEventListener('change',()=> { $('template-row').hidden=$('filename-format').value!=='custom'; clearDownload(); });
+for(const id of ['device','quality','title','author','filename-template']) $(id).addEventListener('input',clearDownload);
+function outputFilename(source, metadata) {
+  const original=source.name.replace(/\.epub$/i,''), title=$('title').value.trim(), author=$('author').value.trim();
+  const fields={title,author,original,year:metadata.year,series:metadata.series,series_index:metadata.series_index,language:metadata.language};
+  const format=$('filename-format').value; let name;
+  if(format==='original') name=original+'-optimized';
+  else if(format==='title-author') name=[title,author].filter(Boolean).join(' - ');
+  else if(format==='author-title') name=[author,title].filter(Boolean).join(' - ');
+  else if(format==='title') name=title;
+  else {
+    const template=$('filename-template').value.trim(); if(!template) throw new Error('Enter a filename template.');
+    name=template.replace(/\{([^{}]+)\}/g, (_,key)=> { if(!Object.hasOwn(fields,key)) throw new Error('Unknown filename field: '+key); return fields[key] || ''; });
+    if(/[{}]/.test(name)) throw new Error('Invalid filename template.');
+  }
+  name=name.replace(/\.epub$/i,'').replace(/[\x00-\x1f<>:"/\\|?*]/g,'_').replace(/^[ .]+|[ .]+$/g,'').slice(0,200);
+  return (name || 'optimized')+'.epub';
+}
 $('optimize').addEventListener('click', async () => {
   if(!file || !book) return; const current=++generation, source=file; clearDownload(); $('optimize').disabled=true;
   try {
-    const result=await Optimizer.process(book,{file:source,device:$('device').value,images:$('images').checked,text:$('text').checked,fonts:$('fonts').checked,quality:Number($('quality').value),title:$('title').value,author:$('author').value,cover:coverFile}, message => {if(current===generation) status(message);});
+    const filename=outputFilename(source,book);
+    const result=await Optimizer.process(book,{file:source,device:$('device').value,images:$('images').checked,text:$('text').checked,fonts:$('fonts').checked,quality:Number($('quality').value),title:$('title').value,author:$('author').value,cover:coverFile,grayscale:$('grayscale').checked,contrast:$('contrast').checked,quantize:$('quantize').checked,quotes:$('quotes').checked,cleanMetadata:$('clean-metadata').checked,generateCover:$('generate-cover').checked}, message => {if(current===generation) status(message);});
     if(current!==generation) return;
-    downloadUrl=URL.createObjectURL(result.blob); $('download').href=downloadUrl; $('download').download=source.name.replace(/\.epub$/i,'')+'-optimized.epub'; $('download').hidden=false;
-    status(`Done! ${result.cover ? `Cover ${result.cover}. ` : ''}${result.images} images optimized, ${result.text} text nodes cleaned, ${result.fonts} font rules removed.${result.skipped ? ` ${result.skipped} resources skipped because they could not be processed.` : ''}`);
+    downloadUrl=URL.createObjectURL(result.blob); $('download').href=downloadUrl; $('download').download=filename; $('download').hidden=false;
+    status(`Done! ${result.cover ? `Cover ${result.cover}. ` : ''}${result.images} images optimized, ${result.text} text nodes cleaned, ${result.fonts} font rules removed, ${result.metadataRemoved} metadata entries removed.${result.skipped ? ` ${result.skipped} resources skipped because they could not be processed.` : ''}`);
   } catch(e) { if(current===generation) status('Could not optimize this book: '+e.message); }
   finally { if(current===generation) $('optimize').disabled=!file; }
 });
