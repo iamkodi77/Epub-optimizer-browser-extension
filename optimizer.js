@@ -25,13 +25,14 @@ const Optimizer = (() => {
     if (!elements(doc, 'manifest').length || !elements(doc, 'metadata').length) throw new Error('The EPUB package is missing its manifest or metadata.');
     return { zip, opfPath, doc, title: elements(doc, 'title')[0]?.textContent || '', author: elements(doc, 'creator')[0]?.textContent || '' };
   }
-  async function image(blob, profile, quality, type) {
+  async function image(blob, profile, quality, type, optimize = true) {
     const bitmap = await createImageBitmap(blob);
     try {
       const [maxW,maxH,levels] = profile, scale = Math.min(1, maxW / bitmap.width, maxH / bitmap.height);
       const canvas = document.createElement('canvas'); canvas.width = Math.max(1, Math.round(bitmap.width * scale)); canvas.height = Math.max(1, Math.round(bitmap.height * scale));
       const ctx = canvas.getContext('2d'); if (!ctx) throw new Error('Canvas is unavailable');
       ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, canvas.width, canvas.height); ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+      if (optimize) {
       const data = ctx.getImageData(0, 0, canvas.width, canvas.height), p = data.data, w = canvas.width, h = canvas.height;
       const gray = new Float32Array(w*h);
       for (let i=0;i<gray.length;i++) gray[i] = Math.max(0, Math.min(255, (0.299*p[i*4]+0.587*p[i*4+1]+0.114*p[i*4+2]-128)*1.5+128));
@@ -41,6 +42,7 @@ const Optimizer = (() => {
         if(x+1<w) gray[i+1]+=err*7/16; if(y+1<h) { if(x>0) gray[i+w-1]+=err*3/16; gray[i+w]+=err*5/16; if(x+1<w) gray[i+w+1]+=err/16; }
       }
       ctx.putImageData(data,0,0);
+      }
       return await new Promise((resolve,reject) => canvas.toBlob(b => b ? resolve(b) : reject(new Error('Image encoding failed')), type, quality/100));
     } finally { bitmap.close(); }
   }
@@ -54,6 +56,48 @@ const Optimizer = (() => {
       if(value!==node.nodeValue) { node.nodeValue=value; count++; }
     }
     return count;
+  }
+  async function replaceCover(zip, doc, base, coverFile, opts) {
+    const metadata = elements(doc, 'metadata')[0], manifest = elements(doc, 'manifest')[0];
+    const items = elements(manifest, 'item');
+    const coverMeta = elements(metadata, 'meta').find(m => (m.getAttribute('name') || '').toLowerCase() === 'cover');
+    const byProperty = items.find(item => (item.getAttribute('properties') || '').split(/\s+/).includes('cover-image'));
+    const byMeta = coverMeta && items.find(item => item.getAttribute('id') === coverMeta.getAttribute('content'));
+    if (byProperty && byMeta && byProperty !== byMeta) throw new Error('The EPUB has conflicting cover references; the cover cannot be replaced safely.');
+    let target = byProperty || byMeta;
+    if (coverMeta && !byMeta) throw new Error('The EPUB cover metadata points to a missing manifest item.');
+    const ns = manifest.namespaceURI;
+    let path, type, added = false;
+    if (target) {
+      type = target.getAttribute('media-type');
+      if (!['image/jpeg', 'image/png'].includes(type)) throw new Error('The existing cover is not a JPEG or PNG; replacing this cover format is not yet supported.');
+      path = pathFor(base, target.getAttribute('href') || '');
+      if (!path || !zip.file(path)) throw new Error('The existing cover image is missing from the EPUB.');
+    } else {
+      const spine = elements(doc, 'spine')[0];
+      if (!spine) throw new Error('Cannot add a cover: the EPUB has no spine.');
+      // Generate names and IDs that do not collide with existing files or OPF IDs.
+      const ids = new Set(Array.from(doc.getElementsByTagName('*')).map(el => el.getAttribute('id')).filter(Boolean));
+      let n = 0, imageId, pageId, imageName, pageName;
+      do { const suffix = n ? '-' + n : ''; imageId = 'optimizer-cover' + suffix; pageId = 'optimizer-cover-page' + suffix; imageName = imageId + '.jpg'; pageName = pageId + '.xhtml'; n++; }
+      while (ids.has(imageId) || ids.has(pageId) || zip.file(base + imageName) || zip.file(base + pageName));
+      path = base + imageName; type = 'image/jpeg'; added = true;
+      target = doc.createElementNS(ns, 'item'); target.setAttribute('id', imageId); target.setAttribute('href', imageName); target.setAttribute('media-type', type);
+      const version = doc.documentElement.getAttribute('version') || '';
+      if (version.startsWith('3')) target.setAttribute('properties', 'cover-image');
+      manifest.appendChild(target);
+      const page = doc.createElementNS(ns, 'item'); page.setAttribute('id', pageId); page.setAttribute('href', pageName); page.setAttribute('media-type', 'application/xhtml+xml'); manifest.appendChild(page);
+      const ref = doc.createElementNS(spine.namespaceURI, 'itemref'); ref.setAttribute('idref', pageId); spine.insertBefore(ref, spine.firstChild);
+      zip.file(base + pageName, `<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title>Cover</title></head><body style="margin:0;text-align:center"><div><img src="${imageName}" alt="Cover" style="max-width:100%;max-height:100%" /></div></body></html>`);
+      if (!version.startsWith('3')) {
+        const meta = doc.createElementNS(metadata.namespaceURI, 'meta'); meta.setAttribute('name', 'cover'); meta.setAttribute('content', imageId); metadata.appendChild(meta);
+      }
+    }
+    let encoded;
+    try { encoded = await image(coverFile, profiles[opts.device], opts.quality, type, opts.images); }
+    catch { throw new Error('The selected cover image could not be decoded. Choose a different image.'); }
+    zip.file(path, encoded);
+    return added ? 'added' : 'replaced';
   }
   async function process(book, opts, progress) {
     // Work on a fresh copy so a failed run or changed options never modifies the source.
@@ -83,6 +127,8 @@ const Optimizer = (() => {
         const css=await entry.async('string'); const updated=css.replace(/@font-face\s*\{[^{}]*\}/gi, () => { fonts++; return ''; }); if(updated!==css) zip.file(path,updated);
       }
     }
+    let cover = null;
+    if (opts.cover) { progress('Applying cover image…'); cover = await replaceCover(zip, doc, base, opts.cover, opts); }
     zip.file(opfPath,serialize(doc));
     const out=new JSZip(); out.file('mimetype','application/epub+zip',{compression:'STORE'});
     for(const [name,entry] of Object.entries(zip.files)) {
@@ -91,7 +137,7 @@ const Optimizer = (() => {
     }
     progress('Packaging your EPUB…');
     const blob=await out.generateAsync({type:'blob',mimeType:'application/epub+zip',compression:'DEFLATE'});
-    return {blob, images, text, fonts, skipped};
+    return {blob, images, text, fonts, skipped, cover};
   }
   return {inspect, process};
 })();
