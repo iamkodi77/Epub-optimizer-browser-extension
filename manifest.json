@@ -1,0 +1,8 @@
+{
+  "manifest_version": 3,
+  "name": "E-ink EPUB Optimizer",
+  "version": "1.0.0",
+  "description": "Optimize EPUBs locally for Xteink and Kindle e-ink readers.",
+  "action": { "default_title": "Open EPUB Optimizer" },
+  "background": { "service_worker": "background.js" }
+}
